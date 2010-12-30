@@ -4,6 +4,7 @@ use MooseX::Role::Parameterized;
 use true;
 use namespace::autoclean;
 use Try::Tiny;
+use Guard qw(scope_guard);
 
 parameter 'name' => (
     is       => 'ro',
@@ -17,6 +18,18 @@ parameter 'method' => (
     isa     => 'Str',
     lazy    => 1,
     default => sub { '_handle_'. $_[0]->name },
+);
+
+# method to be called when interest in data changes; if there are
+# handlers in the queue or there is a default handler, the method is
+# invoked with 1.  if there are no handlers and data would be
+# queued, the method is called with 0.
+# defaults to _whatever_handler_state_change
+parameter 'state_change_method' => (
+    is      => 'ro',
+    isa     => 'Str',
+    lazy    => 1,
+    default => sub { '_'. $_[0]->name. '_state_change' },
 );
 
 # attribute that is the arrayref of callbacks to call when data is available;
@@ -121,6 +134,8 @@ role {
     confess 'need a data count delegate' unless $data_methods{count};
     confess 'need a data push delegate' unless $data_methods{push};
 
+    my $name = $role->name;
+
     # aliases for $self->$method_name calls (there are a lot of these,
     # which hopefully make the generated methods more readable.
     # hopefully.)
@@ -128,8 +143,28 @@ role {
     my $get_data = $data_methods{shift};
     my $put_data = $data_methods{push};
 
-    my $error_handler = $role->error_handler;
+    my $has_handler = $handler_methods{count};
+    my $get_handler = $handler_methods{shift};
     my $cb_name = $role->default_callback_attribute;
+    my $has_default_handler = "has_$cb_name";
+    my $get_default_handler = $cb_name;
+    my $error_handler = $role->error_handler;
+
+    # requires a method to be called upon state change
+    my $state_change_method = $role->state_change_method;
+    requires $state_change_method;
+
+    my $set_state = "_${name}_state";
+    has $set_state => (
+        accessor => $set_state,
+        isa      => 'Bool',
+        default  => 0,
+        trigger  => sub {
+            my ($self, $new, $old) = @_;
+            no warnings 'uninitialized';
+            $self->$state_change_method($new) if $new != $old;
+        }
+    );
 
     # this is what the trigger calls to process all queued data.  it's
     # a method that you can override.
@@ -161,10 +196,16 @@ role {
         clearer   => "clear_$cb_name",
         trigger   => sub {
             my ($self, $new, $old) = @_;
-            return unless $new;
-            $self->$handle_queued_data($new);
+            # scope guard because handlers can die
+            scope_guard { $self->$set_state( defined $new || $self->$has_handler ) };
+            $self->$handle_queued_data($new) if $new;
         },
     );
+
+    after "clear_$cb_name" => sub {
+        my $self = shift;
+        $self->$set_state( $self->$has_handler );
+    };
 
     # this is the queue of handler coderefs
     has $role->handler_queue_attribute => (
@@ -183,16 +224,15 @@ role {
         handles => $role->data_queue_delegates,
     );
 
-    # a few more aliases
-    my $has_handler = $handler_methods{count};
-    my $get_handler = $handler_methods{shift};
-    my $has_default_handler = "has_$cb_name";
-    my $get_default_handler = $cb_name;
-
     # this is the method the user calls to inject data
     my $handler_method = $role->method;
     method $handler_method => sub {
         my ($self, @args) = @_;
+
+        # scope guard because handlers can die
+        scope_guard {
+            $self->$set_state( $self->$has_default_handler || $self->$has_handler );
+        };
 
         # prefer a queued handler, then the default handler, then nothing
         my $handler =
@@ -216,7 +256,7 @@ role {
         return;
     };
 
-    # we set up around watchers on anything that adds to the handler
+    # we set up around watchers on anything that  adds to the handler
     # queue, so that we can call the handler with pending data, if
     # there is some.
     my @handler_writers = grep { defined } map {
@@ -226,6 +266,11 @@ role {
     if(@handler_writers){
         after @handler_writers => sub {
             my $self = shift;
+            # scope guard because handlers can die
+            scope_guard {
+                $self->$set_state( $self->$has_default_handler || $self->$has_handler );
+            };
+
             while(($self->$has_default_handler || $self->$has_handler)
                       && $self->$has_data){
                 # while we have data or a handler, take it out of the

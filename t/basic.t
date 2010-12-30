@@ -8,6 +8,13 @@ use Test::Exception;
     use Moose;
     use namespace::autoclean;
 
+    has 'want_read' => (
+        writer  => '_read_state_change',
+        reader  => 'want_read',
+        isa     => 'Bool',
+        default => 0,
+    );
+
     with 'MooseX::Role::EventQueue' => {
         name          => 'read',
         error_handler => sub { die "XXX: $_[1]" },
@@ -20,7 +27,9 @@ my @default;
 
 my $foo = Class->new( on_read => sub { shift; push @default, @_ } );
 
-can_ok $foo, '_handle_read';
+can_ok $foo, '_handle_read', 'want_read';
+
+ok $foo->want_read, 'wants read, since on_read is set';
 
 $foo->_handle_read('this is some data', 'and some more');
 
@@ -50,6 +59,8 @@ is_deeply \@default, ['this is some data', 'and some more'],
     can_ok $foo, 'clear_on_read', 'has_queued_read_data';
     $foo->clear_on_read;
 
+    ok !$foo->want_read, 'does not want read';
+
     ok !$foo->has_queued_read_data, 'no queued read data yet';
     $foo->_handle_read('foo', 'bar');
     $foo->_handle_read('OH HAI');
@@ -63,6 +74,9 @@ is_deeply \@default, ['this is some data', 'and some more'],
 
     @default = ();
     $foo->on_read( sub { shift; push @default, @_ } );
+
+    ok $foo->want_read, 'wants read again';
+
     is_deeply [@default], [ 'OH HAI', { refs => 'are also ok' } ],
         'got the rest of the data';
 
@@ -76,14 +90,19 @@ is_deeply \@default, ['this is some data', 'and some more'],
 
 {
     $foo->clear_on_read;
+    ok !$foo->want_read;
 
     lives_ok {
         $foo->push_read(sub { die 'EXCEPTIONALLY BAD SITUATION' });
     } 'exception is deferred';
 
+    ok $foo->want_read;
+    
     throws_ok {
         $foo->_handle_read('OH NOES');
     } qr/XXX: EXCEPTIONALLY BAD SITUATION/, 'our error handler fires';
+
+    ok !$foo->want_read;
 
     lives_ok {
         $foo->_handle_read('to queue');
